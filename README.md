@@ -96,7 +96,7 @@ ComfyUI/custom_nodes/ComfyUI_Tagger_Worker/
 
 ### モデル別カテゴリ対応表
 
-| カテゴリ | camie | anima | WD14 | JoyTag |
+| カテゴリ | camie | pixai | WD14 | JoyTag |
 |---|---|---|---|---|
 | general | ✅ | ✅ | ✅ | ✅(全部) |
 | character | ✅ | ✅ | ✅ | ❌ |
