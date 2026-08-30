@@ -41,6 +41,9 @@ if sys.platform == "win32":
 
 import onnxruntime as ort
 
+import ensemble_catalog
+import ensemble_preprocess
+
 # stdout を UTF-8 に固定（Windows cp932 対策）
 if sys.platform == "win32":
     try:
@@ -120,29 +123,71 @@ def _get_process_memory_mb() -> float:
 # ---------------------------------------------------------------------------
 # セッション生成（共通ユーティリティ）
 # ---------------------------------------------------------------------------
+# device リクエスト値 → OpenVINO EP に順に試す device_type の優先順位チェーン。
+# "NPU" が選択された場合、NPUが無い/失敗した場合は iGPU (OpenVINO "GPU") に、
+# それも失敗した場合は最終的に素の CPUExecutionProvider に自動フォールバックする。
+# "CPU" が明示的に選択された場合はOpenVINO EPを試さず直接CPUで実行する。
+_DEVICE_FALLBACK_CHAIN = {
+    "NPU": ["NPU", "GPU"],
+    "GPU": ["GPU"],
+    "CPU": [],
+}
+
+
 def _create_ort_session(onnx_path: str, cache_dir: str, device: str) -> tuple:
-    """OpenVINO EP → CPU の順でセッションを生成。(session, actual_backend) を返す。"""
+    """
+    優先順位 NPU > iGPU(OpenVINO "GPU") > CPU でセッション生成を試み、
+    (session, actual_backend) を返す。
+    各段階の失敗はWARNINGログを出しつつ次の候補へ進み、
+    OpenVINO EPの候補が尽きた場合のみ素のCPUExecutionProviderへ最終フォールバックする。
+    """
     os.makedirs(cache_dir, exist_ok=True)
-    providers = [
-        ("OpenVINOExecutionProvider", {
-            "device_type": device,
-            "cache_dir":   cache_dir,
-        }),
-        "CPUExecutionProvider",
-    ]
-    try:
-        session = ort.InferenceSession(onnx_path, providers=providers)
-        actual  = session.get_providers()[0]
-        print(f"[Worker] Session created with provider: {actual}", flush=True)
-        return session, actual
-    except Exception as e:
-        if device != "CPU":
-            print(f"[Worker WARNING] {device} provider failed ({e}), falling back to CPU.", flush=True)
-            session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    ov_candidates = _DEVICE_FALLBACK_CHAIN.get(device, [device] if device != "CPU" else [])
+
+    last_error = None
+    for ov_device in ov_candidates:
+        try:
+            providers = [
+                ("OpenVINOExecutionProvider", {
+                    "device_type": ov_device,
+                    "cache_dir":   cache_dir,
+                }),
+                "CPUExecutionProvider",
+            ]
+            session = ort.InferenceSession(onnx_path, providers=providers)
             actual  = session.get_providers()[0]
-            print(f"[Worker] Session created with fallback provider: {actual}", flush=True)
+            if ov_device != device:
+                print(
+                    f"[Worker] Requested device '{device}' unavailable, "
+                    f"fell back to OpenVINO device_type='{ov_device}'.",
+                    flush=True,
+                )
+            print(
+                f"[Worker] Session created with provider: {actual} "
+                f"(device_type={ov_device})",
+                flush=True,
+            )
             return session, actual
-        raise
+        except Exception as e:
+            last_error = e
+            print(
+                f"[Worker WARNING] OpenVINO device_type='{ov_device}' failed ({e}), "
+                "trying next candidate in priority chain.",
+                flush=True,
+            )
+            continue
+
+    # OpenVINO EP候補が全て失敗、または最初からCPU指定 → 素のCPU EPへ
+    if ov_candidates:
+        print(
+            f"[Worker WARNING] All OpenVINO device candidates failed ({last_error}), "
+            "falling back to plain CPUExecutionProvider.",
+            flush=True,
+        )
+    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    actual  = session.get_providers()[0]
+    print(f"[Worker] Session created with fallback provider: {actual}", flush=True)
+    return session, actual
 
 
 def _model_onnx_path(model_id: str) -> str:
@@ -158,8 +203,11 @@ def _model_cache_dir(model_id: str) -> str:
 # ---------------------------------------------------------------------------
 # LRU 解放: _session_lock 保持状態で呼ぶこと
 # ---------------------------------------------------------------------------
+RESERVED_MODEL_IDS = {"censor_detect", "isnet_anime"}
+
+
 def _evict_lru_if_needed():
-    tagger_keys = [(mid, dev) for (mid, dev) in _session_cache if mid != "censor_detect"]
+    tagger_keys = [(mid, dev) for (mid, dev) in _session_cache if mid not in RESERVED_MODEL_IDS]
     if len(tagger_keys) <= MAX_LOADED_MODELS:
         return
     oldest_key = min(tagger_keys, key=lambda k: _session_cache[k].last_used)
@@ -236,7 +284,7 @@ def get_session(model_id: str, device: str) -> tuple:
         entry = SessionEntry(session=session, device=device, actual_backend=actual)
         _session_cache[key] = entry
 
-        if model_id != "censor_detect":
+        if model_id not in RESERVED_MODEL_IDS:
             _evict_lru_if_needed()
 
         return entry.session, entry.actual_backend
@@ -279,6 +327,103 @@ def _cleanup_loop():
             _cleanup_sessions()
         except Exception as e:
             print(f"[Worker WARNING] cleanup_sessions error: {e}", flush=True)
+
+# ---------------------------------------------------------------------------
+# タグ辞書: Lazy Load
+# ---------------------------------------------------------------------------
+# tagger_ensemble_worker(cl_v1/cl_v2/dtq系/oppai_v11/wd_eva02_l)側のカテゴリ番号体系
+# (tagcomplete/Danbooru/animetimm互換: 0=general,1=artist,3=copyright,4=character,5=meta,9=rating)
+# を、このworkerが既存4タガー(camie/anima/wd14)で使っている文字列カテゴリ名へ変換する。
+_ENSEMBLE_CATEGORY_ID_TO_NAME = {
+    0: "general", 1: "artist", 3: "copyright", 4: "character", 5: "meta", 9: "rating",
+}
+
+_ENSEMBLE_ORT_DTYPE_TO_NUMPY = {
+    "tensor(float)":   np.float32,
+    "tensor(float16)": np.float16,
+    "tensor(double)":  np.float64,
+    "tensor(int64)":   np.int64,
+    "tensor(int32)":   np.int32,
+    "tensor(bool)":    np.bool_,
+    "tensor(uint8)":   np.uint8,
+    "tensor(int8)":    np.int8,
+}
+
+
+def _resolve_ensemble_pixel_input(session):
+    """
+    セッションの全入力からpixel_values相当(画像本体)の入力を特定する。
+    tagger_ensemble_worker (tew_backends/onnx_backend.py) の判定ロジックを移植。
+    cl_v1/cl_v2/oppai_v11 等はpadding_mask等の補助入力を持つため、単一入力決め打ちにしない。
+    """
+    raw_inputs = session.get_inputs()
+    if not raw_inputs:
+        raise RuntimeError("ONNXモデルに入力が1つもありません")
+
+    for candidate_name in ("pixel_values", "input", "images", "image"):
+        for meta in raw_inputs:
+            if meta.name.lower() == candidate_name:
+                return meta, raw_inputs
+
+    for meta in raw_inputs:
+        shape = list(meta.shape)
+        if len(shape) == 4 and (3 in shape or "3" in [str(d) for d in shape]):
+            return meta, raw_inputs
+
+    print(
+        "[Worker WARNING] pixel_values相当の入力を自動判別できませんでした。"
+        f"先頭入力({raw_inputs[0].name})を採用します。",
+        flush=True,
+    )
+    return raw_inputs[0], raw_inputs
+
+
+def _build_ensemble_auxiliary_input(model_id: str, input_meta, pixel_values: np.ndarray) -> np.ndarray:
+    """
+    pixel_values以外の必須ONNX入力(padding_mask等)に対する汎用フォールバック生成。
+    tagger_ensemble_worker側の前処理は常に画像をinput_sizeぴったりへリサイズ/パディング
+    済みにしてから渡すため、「有効領域=画像全体、パディング領域=無し」という前提のもとで
+    「全要素がパディングなしを表す値」を生成する(dtypeがbool/int系なら0/False、float系なら1.0)。
+    実際のモデル仕様と異なる場合は、このモデルの意味に応じた専用ビルダーを別途追加すること。
+    """
+    shape = list(input_meta.shape)
+    batch = pixel_values.shape[0]
+    img_h = pixel_values.shape[-2] if pixel_values.ndim >= 2 else 1
+    img_w = pixel_values.shape[-1] if pixel_values.ndim >= 2 else 1
+
+    resolved_shape = []
+    for i, dim in enumerate(shape):
+        if i == 0:
+            resolved_shape.append(batch)
+        elif isinstance(dim, int) and dim > 0:
+            resolved_shape.append(dim)
+        else:
+            resolved_shape.append(img_h if i == len(shape) - 2 else (img_w if i == len(shape) - 1 else 1))
+
+    np_dtype = _ENSEMBLE_ORT_DTYPE_TO_NUMPY.get(input_meta.type, np.float32)
+    if np_dtype in (np.bool_, np.int64, np.int32, np.uint8, np.int8):
+        fill_value = False if np_dtype is np.bool_ else 0
+    else:
+        fill_value = 1.0
+
+    print(
+        f"[Worker WARNING] model_id={model_id}: 補助入力 '{input_meta.name}' "
+        f"(shape={shape}, dtype={input_meta.type}) を汎用フォールバック"
+        f"(shape={resolved_shape}, fill={fill_value!r})で生成します。",
+        flush=True,
+    )
+    return np.full(resolved_shape, fill_value, dtype=np_dtype)
+
+
+def _build_ensemble_input_feed(pixel_input_meta, raw_inputs, batched_pixel_values, model_id):
+    pixel_dtype = _ENSEMBLE_ORT_DTYPE_TO_NUMPY.get(pixel_input_meta.type, np.float32)
+    feed = {pixel_input_meta.name: batched_pixel_values.astype(pixel_dtype)}
+    for meta in raw_inputs:
+        if meta.name == pixel_input_meta.name:
+            continue
+        feed[meta.name] = _build_ensemble_auxiliary_input(model_id, meta, batched_pixel_values)
+    return feed
+
 
 # ---------------------------------------------------------------------------
 # タグ辞書: Lazy Load
@@ -383,6 +528,39 @@ def _load_tags_from_file(model_id: str) -> tuple:
         print(f"[Worker] Loaded {len(tags)} JoyTag tags.", flush=True)
         return tags, {}
 
+    elif model_id in ensemble_catalog.ENSEMBLE_MODEL_IDS:
+        entry = ensemble_catalog.get_ensemble_entry(model_id)
+        tags_path = os.path.join(BASE_DIR, "models", model_id, entry.tags_filename)
+        category_path = (
+            os.path.join(BASE_DIR, "models", model_id, entry.category_filename)
+            if entry.category_filename else None
+        )
+        if not os.path.exists(tags_path):
+            raise FileNotFoundError(f"{tags_path} が見つかりません。")
+        print(f"[Worker] Loading {model_id} tags from {tags_path}...", flush=True)
+        tags = ensemble_preprocess.load_tag_list(tags_path, category_path)
+        raw_categories = ensemble_preprocess.load_tag_categories(
+            tags_path, category_path, expected_tag_count=len(tags)
+        )
+        # tagger_ensemble_worker側のカテゴリ番号(0=general,1=artist,3=copyright,
+        # 4=character,5=meta,9=rating)を、このworkerが使う文字列カテゴリ名へ変換する。
+        tag_to_category = {}
+        unknown_cat_count = 0
+        for tag, cat_id in raw_categories.items():
+            name = _ENSEMBLE_CATEGORY_ID_TO_NAME.get(cat_id)
+            if name is None:
+                unknown_cat_count += 1
+                continue
+            tag_to_category[tag] = name
+        if unknown_cat_count:
+            print(
+                f"[Worker WARNING] model_id={model_id}: 未知のcategory ID {unknown_cat_count}件は"
+                "general扱いになります。",
+                flush=True,
+            )
+        print(f"[Worker] Loaded {len(tags)} {model_id} tags.", flush=True)
+        return tags, tag_to_category
+
     else:
         raise ValueError(f"Unknown model for tag loading: {model_id}")
 
@@ -477,6 +655,41 @@ def preprocess_censor(image_pil: Image.Image):
     arr = np.transpose(arr, (2, 0, 1))
     arr = np.expand_dims(arr, 0)    # [1, 3, 640, 640]
     return arr, scale, orig_w, orig_h
+
+
+ISNET_MEAN = (0.485, 0.456, 0.406)
+ISNET_STD  = (1.0, 1.0, 1.0)
+ISNET_SIZE = (1024, 1024)
+
+
+def preprocess_isnet(image_pil: Image.Image) -> np.ndarray:
+    """isnet-anime 標準前処理（rembg dis_anime.py 準拠: LANCZOSリサイズ + mean/std正規化）。"""
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:
+        resample = Image.LANCZOS
+    im = image_pil.convert("RGB").resize(ISNET_SIZE, resample)
+    im_ary = np.array(im).astype(np.float32)
+    im_ary = im_ary / max(np.max(im_ary), 1e-6)
+    tmp = np.zeros((im_ary.shape[0], im_ary.shape[1], 3), dtype=np.float32)
+    for c in range(3):
+        tmp[:, :, c] = (im_ary[:, :, c] - ISNET_MEAN[c]) / ISNET_STD[c]
+    tmp = tmp.transpose((2, 0, 1))
+    return np.expand_dims(tmp, 0).astype(np.float32)
+
+
+def postprocess_isnet(output: np.ndarray, orig_w: int, orig_h: int) -> Image.Image:
+    """min-max正規化 → 0-255グレースケール → 元サイズへLANCZOSリサイズ。"""
+    pred = output[:, 0, :, :]
+    ma, mi = np.max(pred), np.min(pred)
+    pred = (pred - mi) / (ma - mi) if ma > mi else pred
+    pred = np.squeeze(pred)
+    mask = Image.fromarray((pred * 255).astype("uint8"), mode="L")
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:
+        resample = Image.LANCZOS
+    return mask.resize((orig_w, orig_h), resample)
 
 
 def _iou(a, b) -> float:
@@ -626,7 +839,7 @@ def handle_request(conn: socket.socket, token: str):
             replace_underscores = req.get("replace_underscores", True)
             raw_scores_mode     = req.get("raw_scores", False)
 
-            SUPPORTED = {"camie", "anima", "wd14", "joytag"}
+            SUPPORTED = {"camie", "anima", "wd14", "joytag"} | ensemble_catalog.ENSEMBLE_MODEL_IDS
             if model_id not in SUPPORTED:
                 raise ValueError(f"Unknown model: {model_id}")
 
@@ -670,6 +883,26 @@ def handle_request(conn: socket.socket, token: str):
             elif model_id == "joytag":
                 arr   = preprocess_joytag(image_pil)
                 probs = session.run(None, {input_name: arr})[0][0]
+
+            elif model_id in ensemble_catalog.ENSEMBLE_MODEL_IDS:
+                entry = ensemble_catalog.get_ensemble_entry(model_id)
+                pixel_input_meta, raw_inputs = _resolve_ensemble_pixel_input(session)
+                shape = list(pixel_input_meta.shape)
+                is_nchw = len(shape) == 4 and (shape[1] == 3 or shape[1] == "3")
+
+                arr = ensemble_preprocess.preprocess(image_pil, model_id)  # (H, W, 3) float32
+                if is_nchw:
+                    arr = np.transpose(arr, (2, 0, 1))
+                batched = np.expand_dims(arr, axis=0).astype(np.float32)
+
+                feed    = _build_ensemble_input_feed(pixel_input_meta, raw_inputs, batched, model_id)
+                outputs = session.run(None, feed)
+                logits  = outputs[0][0]
+
+                if entry.apply_sigmoid:
+                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -88, 88)))
+                else:
+                    probs = logits
 
             # 推論後に last_used 更新
             with _session_lock:
@@ -786,6 +1019,38 @@ def handle_request(conn: socket.socket, token: str):
                 "status":         "ok",
                 "actual_backend": actual_backend,
                 "detections":     len(detections),
+            }).encode("utf-8"))
+            return
+
+        # ================================================================
+        # action: "isnet_anime" – アニメ向け前景/背景セグメンテーション
+        # ================================================================
+        if action == "isnet_anime":
+            input_path  = req.get("input_path")
+            output_path = req.get("output_path")
+            device_req  = req.get("device", "NPU")
+
+            if not os.path.exists(input_path):
+                raise FileNotFoundError(f"Input image not found: {input_path}")
+            image_pil = Image.open(input_path).convert("RGB")
+            orig_w, orig_h = image_pil.size
+
+            session, actual_backend = get_session("isnet_anime", device_req)
+            arr    = preprocess_isnet(image_pil)
+            output = session.run(None, {session.get_inputs()[0].name: arr})[0]
+            mask   = postprocess_isnet(output, orig_w, orig_h)
+
+            # 推論後に last_used 更新
+            with _session_lock:
+                entry = _session_cache.get(("isnet_anime", device_req))
+                if entry:
+                    entry.touch()
+
+            mask.save(output_path, format="BMP")
+
+            conn.sendall(json.dumps({
+                "status":         "ok",
+                "actual_backend": actual_backend,
             }).encode("utf-8"))
             return
 

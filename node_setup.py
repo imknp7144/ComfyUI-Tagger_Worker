@@ -374,6 +374,48 @@ def send_mosaic_request(
     return torch.stack(output_images, dim=0), actual_backend
 
 
+def send_isnet_request(image, device):
+    """
+    ComfyUI IMAGE テンソル (B, H, W, C) を受け取り、
+    前景マスク (ComfyUI MASK テンソル, B, H, W) と actual_backend を返す。
+    """
+    import torch
+    _start_worker()
+
+    output_masks = []
+    actual_backends_list = []
+    img_np = (image.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+
+    for i in range(img_np.shape[0]):
+        pil_img = Image.fromarray(img_np[i])
+        fd_in, input_path   = tempfile.mkstemp(prefix="comfyui_isnet_in_",  suffix=".bmp")
+        fd_out, output_path = tempfile.mkstemp(prefix="comfyui_isnet_out_", suffix=".bmp")
+        os.close(fd_in)
+        os.close(fd_out)
+        try:
+            pil_img.save(input_path, format="BMP")
+            res = _send_recv({
+                "action":      "isnet_anime",
+                "token":       _worker_token,
+                "input_path":  input_path,
+                "output_path": output_path,
+                "device":      device,
+            })
+            mask_np = np.array(Image.open(output_path).convert("L")).astype(np.float32) / 255.0
+            output_masks.append(torch.from_numpy(mask_np))
+            actual_backends_list.append(res.get("actual_backend", "unknown"))
+        finally:
+            for path in (input_path, output_path):
+                try:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                except Exception:
+                    pass
+
+    actual_backend = actual_backends_list[0] if actual_backends_list else "unknown"
+    return torch.stack(output_masks, dim=0), actual_backend
+
+
 # ---------------------------------------------------------------------------
 # Setup ノード
 # ---------------------------------------------------------------------------
